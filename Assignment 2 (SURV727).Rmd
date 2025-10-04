@@ -1,0 +1,306 @@
+---
+title: "Assignment 2 (Alternate) (SURV727)"
+author: "James Dill"
+date: "2025-09-27"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(covidcast)
+library(gtrendsR)
+library(censusapi)
+library(readr)
+library(tidyverse)
+```
+
+-   Link to GitHub Repo: <https://github.com/jcdill500/SURV_727>
+
+## Part 1: Pulling from APIs, Delphi
+
+```{r, message=FALSE}
+covid <- covidcast_signal(
+  data_source = "fb-survey",
+  signal = "smoothed_wcli",
+  start_day = as.Date("2020-04-01"),
+  end_day   = as.Date("2020-04-14"),
+  geo_type = "county"
+)
+
+head(covid)
+```
+
+**Reshaping to Wide Format:**
+
+```{r}
+covid_wide<-covid|>
+  select(geo_value, time_value, value)|>
+  pivot_wider(names_from=time_value,
+              values_from=value)
+
+head(covid_wide)
+```
+
+**Mean, Median, and Variance from April 6th to the 14th**
+
+```{r}
+summary_stats<-covid|>
+  subset(time_value>=as.Date("2020-04-06"),
+         time_value<=as.Date("2020-04-14"))|>
+  group_by(time_value)|>
+  summarize(
+    cov_mean= mean(value, na.rm=T),
+    cov_median= median(value, na.rm=T),
+    cov_var= var(value, na.rm=T)
+  )
+
+summary_stats
+```
+
+-   The mean appears to have a slightly decreasing trend from April 6th to the 14th, as well as the median. Additionally, the variance starts higher on the 6th at 0.454, but decreases to 0.255 by the 14th.
+
+**Counties with highest number of symptoms**
+
+```{r}
+top_counties<-covid|>
+  filter(time_value>=as.Date("2020-04-06"),
+         time_value<=as.Date("2020-04-14"))|>
+  group_by(time_value)|>
+  slice_max(order_by=value, n=1, with_ties=F)|>
+  select(time_value, geo_value, value)
+
+top_counties
+```
+
+-   The FIPS codes for the top counties in number of symptoms are all in New York. On most days from April 6th to the 14th, Schenectady, New York was the highest in number of reported symptoms, with the first and last days being the Bronx and Queens counties, respectively.
+
+**Comparing Covid-19 symptoms with actual cases and analyzing relationship**
+
+```{r, message=FALSE}
+#Combing both datasets
+symptoms<-covidcast_signal(
+  data_source="fb-survey",
+  signal="smoothed_wcli",
+  start_day=as.Date("2020-04-06"),
+  end_day=as.Date("2020-04-14"),
+  geo_type="county"
+)
+
+#mean values of symptoms
+symptoms_county<-symptoms|>
+  group_by(geo_value)|>
+  summarize(symptom_mean = mean(value, na.rm=T))
+
+symptoms_county
+
+#Confirmed Cases
+cases<-covidcast_signal(data_source="jhu-csse",
+  signal="confirmed_7dav_incidence_prop",
+  start_day=as.Date("2020-05-06"),
+  end_day=as.Date("2020-05-14"),
+  geo_type="county"
+)
+
+cases_county<-cases|>
+  group_by(geo_value)|>
+  summarize(cases_mean=mean(value, na.rm=T))
+
+merged<-inner_join(symptoms_county, cases_county, 
+                   by="geo_value")
+head(merged)
+
+#Finding correlation coefficient, making linear regression, and plotting over scatterplot
+cor<-cor.test(merged$symptom_mean,
+                   merged$cases_mean,
+                   use="complete.obs")
+
+cor
+
+merge_reg<-lm(cases_mean~symptom_mean, data=merged)
+summary(merge_reg)
+
+merged|>
+  ggplot(aes(x=symptom_mean, y=cases_mean))+
+  geom_point(alpha=0.5, color="darkviolet")+
+  geom_smooth(method="lm", se=F, color="coral")+
+  labs(x="Mean Covid symptoms From Apr 6-14",
+       y="Confirmed cases",
+       title="COVID Symptoms and Confirmed cases per 100k people")
+```
+
+-   The data illustrates that there is a slightly positive but statistically significant relationship between reporting Covid-like symptoms and actual confirmed cases between April 6th to the 14th in 2020. The correlation coefficient is 0.098, which is relatively weak but positive. The graph further shows a somewhat positive trajectory between the two variables.
+
+## Part 2: Covidcast API Data + ACS
+
+```{r}
+cs_key <- read_file("api_key.txt")
+
+acs <- getCensus(name = "acs/acs5",
+                 vintage = 2020,
+                 vars = c("NAME",
+                          "B01001_001E",
+                          "B06002_001E",
+                          "B19013_001E",
+                          "B19301_001E"),
+                 region = "county",
+                 key = cs_key)
+head(acs)
+
+acs <-
+  acs %>%
+  rename(pop = B01001_001E,
+         age = B06002_001E,
+         hh_income = B19013_001E,
+         income = B19301_001E)
+
+acs<-acs|>
+  mutate(
+    state=str_pad(state, width=2, pad="0"),
+    county = str_pad(county, width=3, pad="0"),
+    location = paste0(state, county)
+  )
+
+head(acs)
+```
+
+**Checking for any counties not matched between datasets and joining them**
+
+```{r}
+acs_ids<-unique(acs$location)
+covid_ids<-unique(merged$geo_value)
+
+covid_not_acs<-setdiff(covid_ids, acs_ids)
+acs_not_covid<-setdiff(acs_ids, covid_ids)
+
+length(covid_not_acs)
+length(acs_not_covid)
+
+#combining and keeping only counties that appear in both datasets
+final_data<-merged|>
+  inner_join(acs, by=c("geo_value"="location"))
+
+head(final_data)
+```
+
+**Comparing means between household income groups**
+
+```{r}
+#Couldn't find available data from before April First, so instead searched at April 6th and compared means there
+covid_apr6<-covid|>
+  filter(time_value==as.Date("2020-04-06"))|>
+  select(geo_value, symptoms=value)
+
+#Joining with ACS
+income_compare<-covid_apr6|>
+  inner_join(acs, by = c("geo_value" = "location"))|>
+  mutate(income_group = if_else(hh_income>mean(hh_income, na.rm=T),"Above average income",
+                                "Below average income")
+  )|>
+  group_by(income_group)|>
+  summarize(mean_symptoms=mean(symptoms, na.rm=T))
+
+income_compare
+```
+
+-   Because I had trouble garnering results from April 1st, I instead looked at the means between income groups on the 6th. The mean number of symptoms on April 6th for above average income group was slightly lower than the below average income group, with 0.918 versus 1.01 respectively. This makes sense, as people of higher income levels will have additional ways of safeguarding against the pandemic, and likely have more economic safety nets making it easier for them to quarantine at home versus going to work in person, if they are able to.
+
+**Finding relationship between household income and Covid symptoms**
+
+```{r, message=FALSE}
+symptoms_county<-symptoms|>
+  group_by(geo_value)|>
+  summarise(symptom_mean=mean(value, na.rm=T))
+
+#Merging with ACS data
+trends_income<-symptoms_county|>
+  inner_join(acs, by=c("geo_value" = "location"))
+
+#Scatterplot
+qplot(x=hh_income,
+      y=symptom_mean,
+      data=trends_income,
+      geom="point",
+      alpha=I(0.5),
+      xlab="Median Household Income",
+      ylab="Percent reporting Covid symptoms",
+      main="Household Income on Covid-like Symptoms on April 6th"
+)+
+  geom_smooth(method="lm", col="steelblue")+
+  theme_light()
+```
+
+-   The graph above illustrates a slightly negative relationship between higher median household income and the likelihood of reporting Covid-19 symptoms. This matches the finding from before. People of higher household income will likely be less exposed, or have less need to put themselves situations of exposure to others that potentially are infected. Whereas those of lower income levels will likely live in areas of higher population density and have less safeguards or access to information to protect themselves from being infected with Covid-19.
+
+**Now repeating the same process with the merge the Delphi COVIDcast data to the 1-year ACS from 2021**
+
+-   It is likely more difficult to use the 2020 1-year ACS as the timespan begins before Covid-19 officially began to spread and grown to a worldwide pandemic, so many counties, espeically rural ones with less exposure, would not have much information during that short time span at all.
+
+```{r, message=FALSE}
+acs<-getCensus(
+  name="acs/acs1",
+  vintage=2021,
+  vars=c("NAME", "B01001_001E", "B06002_001E", "B19013_001E", "B19301_001E"),
+  region="county",
+  key=cs_key
+)
+
+acs<-acs|>
+  rename(
+    pop = B01001_001E,
+    age = B06002_001E,
+    hh_income = B19013_001E,
+    income = B19301_001E
+  )
+
+acs<-acs|>
+  mutate(
+    state=str_pad(state, width=2, pad="0"),
+    county=str_pad(county, width=3, pad="0"),
+    location=paste0(state, county)
+  )
+
+covid<-covidcast_signal(
+  data_source="fb-survey",
+  signal="smoothed_wcli",
+  start_day=as.Date("2020-04-01"),
+  end_day=as.Date("2020-04-14"),
+  geo_type="county"
+)
+
+symptoms_county<-covid|>
+  group_by(geo_value)|>
+  summarize(symptom_mean=mean(value, na.rm=T))
+
+final_data<-symptoms_county|>
+  inner_join(acs, by = c("geo_value" = "location"))
+
+covid_ids<-unique(symptoms_county$geo_value)
+acs_ids<-unique(acs$location)
+
+covid_not_acs<-setdiff(covid_ids, acs_ids)
+acs_not_covid<-setdiff(acs_ids, covid_ids)
+
+length(covid_not_acs)
+length(acs_not_covid)
+
+income_compare<-final_data|>
+  mutate(income_group = if_else(hh_income>mean(hh_income, na.rm=T),"Above average income",
+                                "Below average income")
+  )|>
+  group_by(income_group)|>
+  summarise(mean_symptoms=mean(symptom_mean, na.rm=T))
+
+income_compare
+
+
+ggplot(final_data, aes(x=hh_income, y=symptom_mean))+
+  geom_point(alpha = 0.5)+
+  geom_smooth(method = "lm", color = "forestgreen") +
+  labs(x="Median Household Income",
+       y="Mean of Those Reporting Symptoms",
+       title="Median Household Income on Covid-19 Symptoms"
+  )+
+  theme_classic()
+```
